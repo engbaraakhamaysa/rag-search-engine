@@ -1,13 +1,14 @@
 import json
 import os
+import re
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 
 class SemanticSearch:
-    def __init__(self):
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
+        self.model = SentenceTransformer(model_name)
         self.embeddings = None
         self.documents = None
         self.document_map = {}
@@ -97,6 +98,171 @@ class SemanticSearch:
         ]
 
 
+class ChunkedSemanticSearch(SemanticSearch):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
+        super().__init__(model_name)
+
+        self.chunk_embeddings = None
+        self.chunk_metadata = None
+
+    def build_chunk_embeddings(
+        self,
+        documents: list[dict],
+    ) -> np.ndarray:
+        self.documents = documents
+
+        for doc in documents:
+            self.document_map[doc["id"]] = doc
+
+        all_chunks = []
+        chunk_metadata = []
+
+        for movie_idx, document in enumerate(self.documents):
+            description = document["description"]
+
+            if not description.strip():
+                continue
+
+            chunks = semantic_chunk_text(
+                description,
+                max_chunk_size=4,
+                overlap=1,
+            )
+
+            total_chunks = len(chunks)
+
+            for chunk_idx, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+
+                chunk_metadata.append(
+                    {
+                        "movie_idx": movie_idx,
+                        "chunk_idx": chunk_idx,
+                        "total_chunks": total_chunks,
+                    }
+                )
+
+        self.chunk_embeddings = self.model.encode(
+            all_chunks,
+            show_progress_bar=True,
+        )
+
+        self.chunk_metadata = chunk_metadata
+
+        os.makedirs("cache", exist_ok=True)
+
+        np.save(
+            "cache/chunk_embeddings.npy",
+            self.chunk_embeddings,
+        )
+
+        with open("cache/chunk_metadata.json", "w") as f:
+            json.dump(
+                {
+                    "chunks": chunk_metadata,
+                    "total_chunks": len(all_chunks),
+                },
+                f,
+                indent=2,
+            )
+
+        return self.chunk_embeddings
+
+    def load_or_create_chunk_embeddings(
+        self,
+        documents: list[dict],
+    ) -> np.ndarray:
+        self.documents = documents
+
+        for doc in documents:
+            self.document_map[doc["id"]] = doc
+
+        embeddings_path = "cache/chunk_embeddings.npy"
+        metadata_path = "cache/chunk_metadata.json"
+
+        if os.path.exists(embeddings_path) and os.path.exists(
+            metadata_path
+        ):
+            self.chunk_embeddings = np.load(embeddings_path)
+
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+
+            self.chunk_metadata = metadata["chunks"]
+
+            return self.chunk_embeddings
+
+        return self.build_chunk_embeddings(documents)
+
+    def search_chunks(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[dict]:
+        if self.chunk_embeddings is None:
+            raise ValueError(
+                "No chunk embeddings loaded. "
+                "Call `load_or_create_chunk_embeddings` first."
+            )
+
+        query_embedding = self.generate_embedding(query)
+
+        chunk_scores = []
+
+        for chunk_idx, chunk_embedding in enumerate(
+            self.chunk_embeddings
+        ):
+            score = cosine_similarity(
+                query_embedding,
+                chunk_embedding,
+            )
+
+            metadata = self.chunk_metadata[chunk_idx]
+
+            chunk_scores.append(
+                {
+                    "chunk_idx": metadata["chunk_idx"],
+                    "movie_idx": metadata["movie_idx"],
+                    "score": score,
+                }
+            )
+
+        movie_scores = {}
+
+        for chunk_score in chunk_scores:
+            movie_idx = chunk_score["movie_idx"]
+            score = chunk_score["score"]
+
+            if (
+                movie_idx not in movie_scores
+                or score > movie_scores[movie_idx]
+            ):
+                movie_scores[movie_idx] = score
+
+        sorted_movies = sorted(
+            movie_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        results = []
+
+        for movie_idx, score in sorted_movies[:limit]:
+            document = self.documents[movie_idx]
+
+            results.append(
+                {
+                    "id": document["id"],
+                    "title": document["title"],
+                    "document": document["description"][:100],
+                    "score": round(score, 4),
+                    "metadata": {},
+                }
+            )
+
+        return results
+
+
 def load_movies():
     with open("data/movies.json") as f:
         data = json.load(f)
@@ -111,7 +277,10 @@ def verify_model():
     print(f"Max sequence length: {search.model.max_seq_length}")
 
 
-def add_vectors(vec1: list[float], vec2: list[float]) -> list[float]:
+def add_vectors(
+    vec1: list[float],
+    vec2: list[float],
+) -> list[float]:
     if len(vec1) != len(vec2):
         raise ValueError("Vectors must have the same length")
 
@@ -123,7 +292,10 @@ def add_vectors(vec1: list[float], vec2: list[float]) -> list[float]:
     return result
 
 
-def subtract_vectors(vec1: list[float], vec2: list[float]) -> list[float]:
+def subtract_vectors(
+    vec1: list[float],
+    vec2: list[float],
+) -> list[float]:
     if len(vec1) != len(vec2):
         raise ValueError("Vectors must have the same length")
 
@@ -135,7 +307,10 @@ def subtract_vectors(vec1: list[float], vec2: list[float]) -> list[float]:
     return result
 
 
-def dot(vec1: list[float], vec2: list[float]) -> float:
+def dot(
+    vec1: list[float],
+    vec2: list[float],
+) -> float:
     if len(vec1) != len(vec2):
         raise ValueError("Vectors must have the same length")
 
@@ -147,7 +322,10 @@ def dot(vec1: list[float], vec2: list[float]) -> float:
     return total
 
 
-def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+def cosine_similarity(
+    vec1: np.ndarray,
+    vec2: np.ndarray,
+) -> float:
     dot_product = np.dot(vec1, vec2)
 
     norm1 = np.linalg.norm(vec1)
@@ -157,6 +335,61 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
         return 0.0
 
     return dot_product / (norm1 * norm2)
+
+
+def semantic_chunk_text(
+    text: str,
+    max_chunk_size: int,
+    overlap: int = 0,
+) -> list[str]:
+    if overlap >= max_chunk_size:
+        raise ValueError(
+            "Overlap must be smaller than max chunk size"
+        )
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text,
+    )
+
+    if len(sentences) == 1:
+        sentence = sentences[0].strip()
+
+        if sentence and not sentence.endswith((".", "!", "?")):
+            sentences = [sentence]
+
+    sentences = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+    ]
+
+    if not sentences:
+        return []
+
+    chunks = []
+
+    step = max_chunk_size - overlap
+
+    for i in range(0, len(sentences), step):
+        chunk_sentences = sentences[
+            i : i + max_chunk_size
+        ]
+
+        if len(chunk_sentences) == 1 and overlap > 0:
+            break
+
+        chunk = " ".join(chunk_sentences).strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks
 
 
 def embed_text(text):
@@ -177,7 +410,8 @@ def verify_embeddings():
     print(f"Number of docs:   {len(movies)}")
     print(
         f"Embeddings shape: "
-        f"{embeddings.shape[0]} vectors in {embeddings.shape[1]} dimensions"
+        f"{embeddings.shape[0]} vectors in "
+        f"{embeddings.shape[1]} dimensions"
     )
 
 
