@@ -13,3 +13,10 @@ wheels/
 
 # Generated search index cache
 /cache/
+
+# Environment variables and secrets
+.env
+
+
+# Local test files
+cli/test_llm.py
