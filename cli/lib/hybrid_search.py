@@ -48,7 +48,11 @@ class HybridSearch:
         limit: int,
     ) -> list[tuple[int, float]]:
         self.idx.load()
-        return self.idx.bm25_search(query, limit)
+
+        return self.idx.bm25_search(
+            query,
+            limit,
+        )
 
     def weighted_search(
         self,
@@ -144,6 +148,8 @@ class HybridSearch:
         k: int = 60,
         limit: int = 5,
     ) -> list[dict]:
+        # Search a large candidate pool,
+        # then return only the top `limit` RRF results.
         search_limit = limit * 500
 
         keyword_results = self._bm25_search(
@@ -165,7 +171,10 @@ class HybridSearch:
             documents[document_id] = {
                 "bm25_rank": rank,
                 "semantic_rank": None,
-                "rrf_score": rrf_score(rank, k),
+                "rrf_score": rrf_score(
+                    rank,
+                    k,
+                ),
             }
 
         for rank, result in enumerate(
@@ -174,7 +183,10 @@ class HybridSearch:
         ):
             document_id = result["id"]
 
-            semantic_rrf = rrf_score(rank, k)
+            semantic_rrf = rrf_score(
+                rank,
+                k,
+            )
 
             if document_id not in documents:
                 documents[document_id] = {
@@ -212,4 +224,5 @@ class HybridSearch:
             reverse=True,
         )
 
-        return results
+        # Return only the requested number of results.
+        return results[:limit]

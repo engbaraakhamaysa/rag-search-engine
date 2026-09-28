@@ -1,74 +1,44 @@
 import argparse
+import json
 import os
+import time
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from sentence_transformers import CrossEncoder
 
 from lib.hybrid_search import HybridSearch
-from lib.semantic_search import load_movies
 
 
 load_dotenv()
 
 
-def normalize_scores(scores: list[float]) -> list[float]:
-    if not scores:
-        return []
-
-    min_score = min(scores)
-    max_score = max(scores)
-
-    if min_score == max_score:
-        return [1.0] * len(scores)
-
-    return [
-        (score - min_score) / (max_score - min_score)
-        for score in scores
-    ]
-
-
-def enhance_query(query: str, method: str | None) -> str:
-    if method is None:
+def enhance_query(
+    query: str,
+    method: str | None,
+) -> str:
+    if not method:
         return query
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY environment variable not set"
-        )
-
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
-
     if method == "spell":
-        prompt = f"""Fix any spelling errors in the user-provided movie search query below.
-Correct only clear, high-confidence typos. Do not rewrite, add, remove, or reorder words.
-Preserve punctuation and capitalization unless a change is required for a typo fix.
-If there are no spelling errors, or if you're unsure, output the original query unchanged.
-Output only the final query text, nothing else.
+        prompt = f"""Correct any spelling mistakes in the movie search query below.
+
 User query: "{query}"
+
+Return only the corrected query.
+
+Do not add explanations.
 """
 
     elif method == "rewrite":
-        prompt = f"""Rewrite the user-provided movie search query below to be more specific and searchable.
+        prompt = f"""Rewrite the movie search query below to make it clearer
+and more effective for semantic and keyword search.
 
-Consider:
-- Common movie knowledge (famous actors, popular films)
-- Genre conventions (horror = scary, animation = cartoon)
-- Keep the rewritten query concise (under 10 words)
-- It should be a Google-style search query, specific enough to yield relevant results
-- Don't use boolean logic
+Preserve the user's original intent.
 
-Examples:
-- "that bear movie where leo gets attacked" -> "The Revenant Leonardo DiCaprio bear attack"
-- "movie about bear in london with marmalade" -> "Paddington London marmalade"
-- "scary movie with bear from few years ago" -> "bear horror movie 2015-2020"
+Return only the rewritten query.
 
-If you cannot improve the query, output the original unchanged.
-Output only the rewritten query text, nothing else.
+Do not add explanations.
 
 User query: "{query}"
 """
@@ -94,178 +64,478 @@ User query: "{query}"
     else:
         return query
 
-    response = client.chat.completions.create(
-        model="openrouter/free",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+    client = OpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+        timeout=30.0,
     )
 
-    enhanced_query = response.choices[0].message.content
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="openrouter/free",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
 
-    if not enhanced_query:
-        return query
+            content = response.choices[0].message.content
 
-    enhanced_query = enhanced_query.strip()
+            if not content:
+                raise ValueError("Empty response from LLM")
 
-    if method == "expand":
-        return f"{query} {enhanced_query}"
+            content = content.strip()
 
-    return enhanced_query
+            if method == "expand":
+                return f"{query} {content}"
+
+            return content
+
+        except Exception as error:
+            print(
+                f"Query enhancement attempt "
+                f"{attempt + 1}/3 failed: {error}"
+            )
+
+            if attempt < 2:
+                time.sleep(3)
+
+    print("Using original query.")
+    return query
+
+
+def rerank_individual(
+    query: str,
+    results: list[dict],
+) -> list[dict]:
+    client = OpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+        timeout=30.0,
+    )
+
+    for index, result in enumerate(results, start=1):
+        print(
+            f"Scoring result {index}/{len(results)}: "
+            f"{result['title']}"
+        )
+
+        prompt = f"""Rate how well this movie matches the search query.
+
+Query: "{query}"
+Movie: {result.get("title", "")} - {result.get("description", "")}
+
+Consider:
+- Direct relevance to query
+- User intent (what they're looking for)
+- Content appropriateness
+
+Rate 0-10 (10 = perfect match).
+Output ONLY the number in your response, no other text or explanation.
+
+Score:"""
+
+        score = 0.0
+
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model="openrouter/free",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        }
+                    ],
+                )
+
+                content = response.choices[0].message.content
+
+                if not content:
+                    raise ValueError("Empty response from LLM")
+
+                score = float(content.strip())
+
+                if not 0 <= score <= 10:
+                    raise ValueError(
+                        "Score must be between 0 and 10"
+                    )
+
+                break
+
+            except Exception as error:
+                print(
+                    f"  Attempt {attempt + 1}/3 failed: "
+                    f"{error}"
+                )
+
+                if attempt < 2:
+                    time.sleep(3)
+
+        result["rerank_score"] = score
+
+        time.sleep(3)
+
+    results.sort(
+        key=lambda result: result["rerank_score"],
+        reverse=True,
+    )
+
+    return results
+
+
+def rerank_batch(
+    query: str,
+    results: list[dict],
+) -> list[dict]:
+    client = OpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+        timeout=60.0,
+    )
+
+    doc_list = []
+
+    for result in results:
+        doc_list.append(
+            f"ID: {result['id']}\n"
+            f"Title: {result['title']}\n"
+            f"Description: {result['description']}"
+        )
+
+    doc_list_str = "\n\n".join(doc_list)
+
+    prompt = f"""Rank the movies listed below by relevance to the following search query.
+
+Query: "{query}"
+
+Movies:
+{doc_list_str}
+
+Return the movie IDs in order of relevance, best match first.
+
+Your response must be a raw JSON array of integers.
+Do not wrap the JSON in Markdown.
+Do not use a ```json code block.
+Do not include any explanatory text.
+
+For example:
+[75, 12, 34, 2, 1]
+
+Ranking:"""
+
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="openrouter/free",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+
+            content = response.choices[0].message.content
+
+            if not content:
+                raise ValueError("Empty response from LLM")
+
+            content = content.strip()
+
+            ranked_ids = json.loads(content)
+
+            if not isinstance(ranked_ids, list):
+                raise ValueError(
+                    "LLM response is not a JSON array"
+                )
+
+            if not all(
+                isinstance(movie_id, int)
+                for movie_id in ranked_ids
+            ):
+                raise ValueError(
+                    "All ranked movie IDs must be integers"
+                )
+
+            result_ids = {
+                result["id"]
+                for result in results
+            }
+
+            if set(ranked_ids) != result_ids:
+                raise ValueError(
+                    "LLM response does not contain "
+                    "exactly the provided movie IDs"
+                )
+
+            if len(ranked_ids) != len(results):
+                raise ValueError(
+                    "LLM response contains duplicate movie IDs"
+                )
+
+            rank_by_id = {
+                movie_id: rank
+                for rank, movie_id in enumerate(
+                    ranked_ids,
+                    start=1,
+                )
+            }
+
+            for result in results:
+                result["rerank_rank"] = rank_by_id[
+                    result["id"]
+                ]
+
+            results.sort(
+                key=lambda result: result["rerank_rank"]
+            )
+
+            return results
+
+        except Exception as error:
+            print(
+                f"Batch re-ranking attempt "
+                f"{attempt + 1}/3 failed: {error}"
+            )
+
+            if attempt < 2:
+                time.sleep(3)
+
+    raise RuntimeError(
+        "Batch re-ranking failed after 3 attempts."
+    )
+
+
+def rerank_cross_encoder(
+    query: str,
+    results: list[dict],
+) -> list[dict]:
+    pairs = []
+
+    for result in results:
+        pairs.append(
+            [
+                query,
+                f"{result.get('title', '')} - "
+                f"{result.get('description', '')}",
+            ]
+        )
+
+    cross_encoder = CrossEncoder(
+        "cross-encoder/ms-marco-TinyBERT-L2-v2"
+    )
+
+    scores = cross_encoder.predict(pairs)
+
+    for result, score in zip(results, scores):
+        result["cross_encoder_score"] = float(score)
+
+    results.sort(
+        key=lambda result: result["cross_encoder_score"],
+        reverse=True,
+    )
+
+    return results
+
+
+def print_results(
+    query: str,
+    k: int,
+    results: list[dict],
+    rerank_method: str | None,
+    limit: int,
+) -> None:
+    print(
+        f"\nReciprocal Rank Fusion Results "
+        f"for '{query}' (k={k}):\n"
+    )
+
+    for index, result in enumerate(
+        results[:limit],
+        start=1,
+    ):
+        print(
+            f"{index}. {result['title']}"
+        )
+
+        if rerank_method == "individual":
+            print(
+                f"   Re-rank Score: "
+                f"{result['rerank_score']:.3f}/10"
+            )
+
+        elif rerank_method == "batch":
+            print(
+                f"   Re-rank Rank: "
+                f"{result['rerank_rank']}"
+            )
+
+        elif rerank_method == "cross_encoder":
+            print(
+                f"   Cross Encoder Score: "
+                f"{result['cross_encoder_score']:.3f}"
+            )
+
+        print(
+            f"   RRF Score: "
+            f"{result['rrf_score']:.3f}"
+        )
+
+        print(
+            f"   BM25 Rank: "
+            f"{result['bm25_rank']}, "
+            f"Semantic Rank: "
+            f"{result['semantic_rank']}"
+        )
+
+        print(
+            f"   {result['description'][:200]}..."
+        )
+
+        print()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Hybrid Search CLI")
+    parser = argparse.ArgumentParser(
+        description="Hybrid movie search CLI"
+    )
 
     subparsers = parser.add_subparsers(
         dest="command",
-        help="Available commands",
-    )
-
-    normalize_parser = subparsers.add_parser(
-        "normalize",
-        help="Normalize scores to the range 0-1",
-    )
-    normalize_parser.add_argument(
-        "scores",
-        nargs="*",
-        type=float,
-        help="Scores to normalize",
-    )
-
-    weighted_parser = subparsers.add_parser(
-        "weighted-search",
-        help="Run weighted hybrid search",
-    )
-    weighted_parser.add_argument(
-        "query",
-        help="Search query",
-    )
-    weighted_parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.5,
-        help="Weight given to keyword search",
-    )
-    weighted_parser.add_argument(
-        "--limit",
-        type=int,
-        default=5,
-        help="Maximum number of results",
+        required=True,
     )
 
     rrf_parser = subparsers.add_parser(
         "rrf-search",
         help="Run Reciprocal Rank Fusion search",
     )
+
     rrf_parser.add_argument(
         "query",
+        type=str,
         help="Search query",
     )
+
     rrf_parser.add_argument(
-        "-k",
+        "--k",
         type=int,
         default=60,
-        help="RRF constant",
+        help="RRF k parameter",
     )
+
     rrf_parser.add_argument(
         "--limit",
         type=int,
         default=5,
-        help="Maximum number of results",
+        help="Number of results to return",
     )
+
     rrf_parser.add_argument(
-        "--enhance",
-        type=str,
-        choices=["spell", "rewrite", "expand"],
-        help="Query enhancement method",
+        "--enhance-method",
+        choices=[
+            "spell",
+            "rewrite",
+            "expand",
+        ],
+        default=None,
+        help="LLM query enhancement method",
+    )
+
+    rrf_parser.add_argument(
+        "--rerank-method",
+        choices=[
+            "individual",
+            "batch",
+            "cross_encoder",
+        ],
+        default=None,
+        help="Re-ranking method",
     )
 
     args = parser.parse_args()
 
-    match args.command:
-        case "normalize":
-            scores = normalize_scores(args.scores)
+    if args.command == "rrf-search":
+        movies = load_movies()
 
-            for score in scores:
-                print(f"* {score:.4f}")
+        search = HybridSearch(movies)
 
-        case "weighted-search":
-            movies = load_movies()
-            search = HybridSearch(movies)
+        enhanced_query = enhance_query(
+            args.query,
+            args.enhance_method,
+        )
 
-            results = search.weighted_search(
-                args.query,
-                args.alpha,
-                args.limit,
+        if enhanced_query != args.query:
+            print(
+                f"\nOriginal query: {args.query}"
             )
 
-            for i, result in enumerate(
-                results[:args.limit],
-                start=1,
-            ):
-                print(f"{i}. {result['title']}")
-                print(
-                    f"  Hybrid Score: {result['hybrid_score']:.3f}"
-                )
-                print(
-                    f"  BM25: {result['bm25_score']:.3f}, "
-                    f"Semantic: {result['semantic_score']:.3f}"
-                )
-                print(
-                    f"  {result['description'][:200]}"
-                )
-
-                if i < min(len(results), args.limit):
-                    print()
-
-        case "rrf-search":
-            query = args.query
-
-            enhanced_query = enhance_query(
-                query,
-                args.enhance,
+            print(
+                f"Enhanced query: {enhanced_query}\n"
             )
 
-            if args.enhance and enhanced_query != query:
-                print(
-                    f"Enhanced query ({args.enhance}): "
-                    f"'{query}' -> '{enhanced_query}'\n"
-                )
+        search_limit = args.limit
 
-            movies = load_movies()
-            search = HybridSearch(movies)
+        if args.rerank_method:
+            search_limit = args.limit * 5
 
-            results = search.rrf_search(
+        results = search.rrf_search(
+            enhanced_query,
+            args.k,
+            search_limit,
+        )
+
+        if args.rerank_method:
+            print(
+                f"Re-ranking top {args.limit} results "
+                f"using {args.rerank_method} method...\n"
+            )
+
+        if args.rerank_method == "individual":
+            results = rerank_individual(
                 enhanced_query,
-                args.k,
-                args.limit,
+                results,
             )
 
-            for i, result in enumerate(
-                results[:args.limit],
-                start=1,
-            ):
-                print(f"{i}. {result['title']}")
-                print(
-                    f"  RRF Score: {result['rrf_score']:.3f}"
-                )
-                print(
-                    f"  BM25 Rank: {result['bm25_rank']}, "
-                    f"Semantic Rank: {result['semantic_rank']}"
-                )
-                print(
-                    f"  {result['description'][:200]}"
-                )
+        elif args.rerank_method == "batch":
+            results = rerank_batch(
+                enhanced_query,
+                results,
+            )
 
-                if i < min(len(results), args.limit):
-                    print()
+        elif args.rerank_method == "cross_encoder":
+            results = rerank_cross_encoder(
+                enhanced_query,
+                results,
+            )
 
-        case _:
-            parser.print_help()
+        print_results(
+            enhanced_query,
+            args.k,
+            results,
+            args.rerank_method,
+            args.limit,
+        )
+
+
+def load_movies() -> list[dict]:
+    with open("data/movies.json", "r") as file:
+        data = json.load(file)
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+
+    raise ValueError(
+        "Could not find a list of movies in data/movies.json"
+    )
 
 
 if __name__ == "__main__":
