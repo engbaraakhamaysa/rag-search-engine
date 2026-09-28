@@ -342,6 +342,103 @@ def rerank_cross_encoder(
     return results
 
 
+def evaluate_results(
+    query: str,
+    results: list[dict],
+) -> list[dict]:
+    client = OpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+        timeout=60.0,
+    )
+
+    formatted_results = []
+
+    for result in results:
+        formatted_results.append(
+            f"Title: {result['title']}\n"
+            f"Description: {result['description']}"
+        )
+
+    prompt = f"""Rate how relevant each result is to this query on a 0-3 scale:
+
+Query: "{query}"
+
+Results:
+{chr(10).join(formatted_results)}
+
+Scale:
+- 3: Highly relevant
+- 2: Relevant
+- 1: Marginally relevant
+- 0: Not relevant
+
+Do NOT give any numbers other than 0, 1, 2, or 3.
+
+Return ONLY the scores in the same order you were given the documents.
+Return a valid JSON list, nothing else.
+
+For example:
+[2, 0, 3, 2, 0, 1]
+"""
+
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="openrouter/free",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+
+            content = response.choices[0].message.content
+
+            if not content:
+                raise ValueError("Empty response from LLM")
+
+            scores = json.loads(content.strip())
+
+            if not isinstance(scores, list):
+                raise ValueError(
+                    "LLM response is not a JSON list"
+                )
+
+            if len(scores) != len(results):
+                raise ValueError(
+                    "Number of scores does not match "
+                    "number of results"
+                )
+
+            if not all(
+                isinstance(score, int) and 0 <= score <= 3
+                for score in scores
+            ):
+                raise ValueError(
+                    "All scores must be integers from 0 to 3"
+                )
+
+            for result, score in zip(results, scores):
+                result["evaluation_score"] = score
+
+            return results
+
+        except Exception as error:
+            print(
+                f"Evaluation attempt "
+                f"{attempt + 1}/3 failed: {error}"
+            )
+
+            if attempt < 2:
+                time.sleep(3)
+
+    raise RuntimeError(
+        "LLM evaluation failed after 3 attempts."
+    )
+
+
 def print_results(
     query: str,
     k: int,
@@ -399,6 +496,21 @@ def print_results(
         print()
 
 
+def print_evaluation(
+    results: list[dict],
+) -> None:
+    print()
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+        print(
+            f"{index}. {result['title']}: "
+            f"{result['evaluation_score']}/3"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Hybrid movie search CLI"
@@ -454,6 +566,12 @@ def main() -> None:
         ],
         default=None,
         help="Re-ranking method",
+    )
+
+    rrf_parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Evaluate search results using an LLM",
     )
 
     args = parser.parse_args()
@@ -519,6 +637,16 @@ def main() -> None:
             args.rerank_method,
             args.limit,
         )
+
+        if args.evaluate:
+            evaluated_results = evaluate_results(
+                enhanced_query,
+                results[:args.limit],
+            )
+
+            print_evaluation(
+                evaluated_results,
+            )
 
 
 def load_movies() -> list[dict]:
